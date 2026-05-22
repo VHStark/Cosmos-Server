@@ -1,4 +1,9 @@
 // Package config manages CLI configuration and credential storage.
+//
+// Tokens are stored in the OS keychain when available (macOS Keychain,
+// Linux libsecret, Windows Credential Manager). On headless Linux servers
+// where no keyring daemon is running, tokens fall back to
+// ~/.cosmos/credentials (chmod 600).
 package config
 
 import (
@@ -6,19 +11,22 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/zalando/go-keyring"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	keyringService = "cosmos-cli"
-	configFileName = "config.yaml"
+	keyringService  = "cosmos-cli"
+	configFileName  = "config.yaml"
+	credsFileName   = "credentials"
 )
 
 // Profile holds the configuration for a single server.
 type Profile struct {
-	URL string `yaml:"url"`
+	URL  string `yaml:"url"`
+	Host string `yaml:"host,omitempty"`
 }
 
 // Config holds all CLI configuration.
@@ -49,6 +57,15 @@ func ConfigPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, configFileName), nil
+}
+
+// credsPath returns path to the fallback credentials file.
+func credsPath() (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, credsFileName), nil
 }
 
 // Load reads the config file. Returns an empty config if the file does not exist.
@@ -102,23 +119,96 @@ func Save(cfg *Config) error {
 	return nil
 }
 
-// SetToken stores a token in the OS keychain for the given profile.
+// SetToken stores a token — tries OS keychain first, falls back to credentials file.
 func SetToken(profile, token string) error {
-	return keyring.Set(keyringService, profile, token)
+	if err := keyring.Set(keyringService, profile, token); err == nil {
+		return nil
+	}
+	// Keychain unavailable (headless server) — use credentials file
+	return setTokenFile(profile, token)
 }
 
-// GetToken retrieves a token from the OS keychain for the given profile.
+// GetToken retrieves a token — tries OS keychain first, falls back to credentials file.
 func GetToken(profile string) (string, error) {
-	token, err := keyring.Get(keyringService, profile)
+	if token, err := keyring.Get(keyringService, profile); err == nil {
+		return token, nil
+	}
+	// Keychain unavailable — try credentials file
+	token, err := getTokenFile(profile)
 	if err != nil {
-		return "", fmt.Errorf("token not found in keychain for profile %q — run 'cosmos configure'", profile)
+		return "", fmt.Errorf("token not found for profile %q — run 'cosmos configure'", profile)
 	}
 	return token, nil
 }
 
-// DeleteToken removes a token from the OS keychain for the given profile.
+// DeleteToken removes a token from keychain and credentials file.
 func DeleteToken(profile string) error {
-	return keyring.Delete(keyringService, profile)
+	_ = keyring.Delete(keyringService, profile)
+	_ = deleteTokenFile(profile)
+	return nil
+}
+
+// setTokenFile writes a token to ~/.cosmos/credentials in INI format.
+func setTokenFile(profile, token string) error {
+	dir, err := configDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	path, _ := credsPath()
+	creds := readCredsFile(path)
+	creds[profile] = token
+
+	var sb strings.Builder
+	for p, t := range creds {
+		sb.WriteString(fmt.Sprintf("[%s]\ntoken = %s\n\n", p, t))
+	}
+
+	return os.WriteFile(path, []byte(sb.String()), 0600)
+}
+
+// getTokenFile reads a token from ~/.cosmos/credentials.
+func getTokenFile(profile string) (string, error) {
+	path, _ := credsPath()
+	creds := readCredsFile(path)
+	if token, ok := creds[profile]; ok {
+		return token, nil
+	}
+	return "", fmt.Errorf("not found")
+}
+
+// deleteTokenFile removes a profile from ~/.cosmos/credentials.
+func deleteTokenFile(profile string) error {
+	path, _ := credsPath()
+	creds := readCredsFile(path)
+	delete(creds, profile)
+	var sb strings.Builder
+	for p, t := range creds {
+		sb.WriteString(fmt.Sprintf("[%s]\ntoken = %s\n\n", p, t))
+	}
+	return os.WriteFile(path, []byte(sb.String()), 0600)
+}
+
+// readCredsFile parses a simple INI credentials file.
+func readCredsFile(path string) map[string]string {
+	creds := make(map[string]string)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return creds
+	}
+	var currentProfile string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentProfile = line[1 : len(line)-1]
+		} else if strings.HasPrefix(line, "token = ") && currentProfile != "" {
+			creds[currentProfile] = strings.TrimPrefix(line, "token = ")
+		}
+	}
+	return creds
 }
 
 // hostFromURL extracts the hostname from a URL string.
@@ -131,7 +221,7 @@ func hostFromURL(rawURL string) string {
 }
 
 // Resolve returns the URL, host header, and token to use for a request.
-// Priority: flags > env vars > config file + keychain.
+// Priority: flags > env vars > config file + keychain/credentials file.
 func Resolve(profileFlag, urlFlag, tokenFlag string) (*Resolved, error) {
 	// 1. Direct flag overrides
 	if urlFlag != "" && tokenFlag != "" {
@@ -155,7 +245,7 @@ func Resolve(profileFlag, urlFlag, tokenFlag string) (*Resolved, error) {
 		return &Resolved{URL: envURL, Host: host, Token: envToken}, nil
 	}
 
-	// 3. Config file + keychain
+	// 3. Config file + keychain/credentials
 	cfg, err := Load()
 	if err != nil {
 		return nil, err
@@ -194,6 +284,9 @@ func Resolve(profileFlag, urlFlag, tokenFlag string) (*Resolved, error) {
 	}
 
 	host := envHost
+	if host == "" {
+		host = p.Host
+	}
 	if host == "" {
 		host = hostFromURL(rawURL)
 	}
